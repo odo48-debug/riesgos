@@ -2,13 +2,31 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 import httpx
 
-app = FastAPI(title="Risk Info API", version="1.1")
+app = FastAPI(title="Risk Info API", version="1.2")
 
 # Helper para armar la URL de GetFeatureInfo
-def build_getfeatureinfo_url(wms_url: str, layer: str, lat: float, lon: float,
-                             width: int = 256, height: int = 256, crs: str = "EPSG:4326") -> str:
-    delta = 0.01  # "ventana" alrededor del punto
-    bbox = f"{lon - delta},{lat - delta},{lon + delta},{lat + delta}"
+def build_getfeatureinfo_url(
+    wms_url: str,
+    layer: str,
+    lat: float,
+    lon: float,
+    width: int = 256,
+    height: int = 256,
+    crs: str = "EPSG:3857"   # usamos EPSG:3857 por defecto
+) -> str:
+    """
+    Construye la URL de GetFeatureInfo centrada en (lat, lon).
+    En EPSG:3857 el orden del BBOX es (lon,lat).
+    """
+    delta = 0.05  # ventana alrededor del punto (ajusta si hace falta)
+
+    if crs == "EPSG:4326":
+        # En WMS 1.3.0 con EPSG:4326 el orden es lat,lon
+        bbox = f"{lat - delta},{lon - delta},{lat + delta},{lon + delta}"
+    else:
+        # En el resto (incluido EPSG:3857), orden lon,lat
+        bbox = f"{lon - delta},{lat - delta},{lon + delta},{lat + delta}"
+
     return (
         f"{wms_url}?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo"
         f"&LAYERS={layer}&QUERY_LAYERS={layer}"
@@ -41,7 +59,7 @@ async def get_all_risks(
         # Riesgo de incendios
         url_incendios = build_getfeatureinfo_url(
             "https://wms.mapama.gob.es/sig/Biodiversidad/Incendios/2006_2015",
-            "NZ.HazardArea", lat, lon
+            "NZ.HazardArea", lat, lon, crs="EPSG:3857"
         )
         results["incendios"] = await fetch_wms(url_incendios)
 
@@ -50,7 +68,7 @@ async def get_all_risks(
         for periodo in ["T10", "T100", "T500"]:
             url = build_getfeatureinfo_url(
                 "https://servicios.idee.es/wms-inspire/riesgos-naturales/inundaciones",
-                f"NZ.Flood.Fluvial{periodo}", lat, lon
+                f"NZ.Flood.Fluvial{periodo}", lat, lon, crs="EPSG:3857"
             )
             results["inundacion_fluvial"][periodo] = await fetch_wms(url)
 
@@ -59,14 +77,14 @@ async def get_all_risks(
         for periodo in ["T100", "T500"]:
             url = build_getfeatureinfo_url(
                 "https://servicios.idee.es/wms-inspire/riesgos-naturales/inundaciones",
-                f"NZ.Flood.Marina{periodo}", lat, lon
+                f"NZ.Flood.Marina{periodo}", lat, lon, crs="EPSG:3857"
             )
             results["inundacion_marina"][periodo] = await fetch_wms(url)
 
         # Riesgo sísmico
         url_sismico = build_getfeatureinfo_url(
             "https://www.ign.es/wms-inspire/geofisica",
-            "HazardArea2002.NCSE-02", lat, lon
+            "HazardArea2002.NCSE-02", lat, lon, crs="EPSG:3857"
         )
         results["sismico"] = await fetch_wms(url_sismico)
 
