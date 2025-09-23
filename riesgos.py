@@ -2,7 +2,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 import httpx
 
-app = FastAPI(title="Risk Info API", version="1.2")
+app = FastAPI(title="Risk Info API", version="1.3")
 
 # Helper para armar la URL de GetFeatureInfo
 def build_getfeatureinfo_url(
@@ -12,20 +12,20 @@ def build_getfeatureinfo_url(
     lon: float,
     width: int = 256,
     height: int = 256,
-    crs: str = "EPSG:3857"   # usamos EPSG:3857 por defecto
+    crs: str = "EPSG:3857",
+    info_format: str = "application/json"
 ) -> str:
     """
     Construye la URL de GetFeatureInfo centrada en (lat, lon).
-    En EPSG:3857 el orden del BBOX es (lon,lat).
+    - EPSG:4326 → orden lat,lon
+    - otros CRS (ej. EPSG:3857) → orden lon,lat
     """
-    delta = 0.05  # ventana alrededor del punto (ajusta si hace falta)
+    delta = 0.05  # ventana alrededor del punto
 
     if crs == "EPSG:4326":
-        # En WMS 1.3.0 con EPSG:4326 el orden es lat,lon
-        bbox = f"{lat - delta},{lon - delta},{lat + delta},{lon + delta}"
+        bbox = f"{lat - delta},{lon - delta},{lat + delta},{lon + delta}"  # lat,lon
     else:
-        # En el resto (incluido EPSG:3857), orden lon,lat
-        bbox = f"{lon - delta},{lat - delta},{lon + delta},{lat + delta}"
+        bbox = f"{lon - delta},{lat - delta},{lon + delta},{lat + delta}"  # lon,lat
 
     return (
         f"{wms_url}?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo"
@@ -33,9 +33,10 @@ def build_getfeatureinfo_url(
         f"&CRS={crs}&BBOX={bbox}"
         f"&WIDTH={width}&HEIGHT={height}"
         f"&I={width//2}&J={height//2}"
-        f"&INFO_FORMAT=application/json"
+        f"&INFO_FORMAT={info_format}"
     )
 
+# Función para consultar un WMS
 async def fetch_wms(url: str):
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -56,14 +57,14 @@ async def get_all_risks(
     try:
         results = {}
 
-        # Riesgo de incendios
+        # 🔥 Riesgo de incendios → usar EPSG:4326 (grados)
         url_incendios = build_getfeatureinfo_url(
             "https://wms.mapama.gob.es/sig/Biodiversidad/Incendios/2006_2015",
-            "NZ.HazardArea", lat, lon, crs="EPSG:3857"
+            "NZ.HazardArea", lat, lon, crs="EPSG:4326"
         )
         results["incendios"] = await fetch_wms(url_incendios)
 
-        # Riesgo inundación (fluvial)
+        # 🌊 Riesgo inundación (fluvial) → usar EPSG:3857 (Web Mercator)
         results["inundacion_fluvial"] = {}
         for periodo in ["T10", "T100", "T500"]:
             url = build_getfeatureinfo_url(
@@ -72,7 +73,7 @@ async def get_all_risks(
             )
             results["inundacion_fluvial"][periodo] = await fetch_wms(url)
 
-        # Riesgo inundación (marina)
+        # 🌊 Riesgo inundación (marina) → usar EPSG:3857
         results["inundacion_marina"] = {}
         for periodo in ["T100", "T500"]:
             url = build_getfeatureinfo_url(
@@ -81,7 +82,7 @@ async def get_all_risks(
             )
             results["inundacion_marina"][periodo] = await fetch_wms(url)
 
-        # Riesgo sísmico
+        # 🌍 Riesgo sísmico → usar EPSG:3857
         url_sismico = build_getfeatureinfo_url(
             "https://www.ign.es/wms-inspire/geofisica",
             "HazardArea2002.NCSE-02", lat, lon, crs="EPSG:3857"
