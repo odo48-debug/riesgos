@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 import math
 import httpx
 from typing import Dict, Any, List, Optional
+import re
 
 app = FastAPI(title="Risk Info API", version="1.6")
 
@@ -131,7 +132,7 @@ def inundable_from_gray(fc: Dict[str, Any]) -> str:
             return "nodata"
         gray = feats[0].get("properties", {}).get("GRAY_INDEX", None)
         if gray is None:
-            return "no_inundable"
+            return "nodata"
         if isinstance(gray, (int, float)):
             if gray == 0:
                 return "no_inundable"
@@ -153,7 +154,7 @@ def parse_sismico_summary(obj: Dict[str, Any]) -> Dict[str, Any]:
         fc = remove_geometry_from_geojson(obj)
         feats = fc.get("features", [])
         if not feats:
-            return {"riesgo_sismico": "desconocido"}
+            return {"riesgo_sismico": "sin_riesgo"}
         props = feats[0].get("properties", feats[0])
         pga = None
         for key in ("PGA", "pga", "aceleracion", "ACCEL", "amax"):
@@ -173,29 +174,31 @@ def parse_sismico_summary(obj: Dict[str, Any]) -> Dict[str, Any]:
             nivel = "alto"
         return {"pga": pga, "riesgo_sismico": nivel}
     except Exception:
-        return {"riesgo_sismico": "desconocido"}
+        return {"riesgo_sismico": "sin_riesgo"}
 
 
-def parse_desertificacion(fc: Dict[str, Any], tipo: str) -> Dict[str, Any]:
-    try:
-        feats = fc.get("features", [])
-        if not feats:
-            return {"tipo": tipo, "nivel": "nodata"}
-        gray = feats[0].get("properties", {}).get("GRAY_INDEX")
-        if gray is None:
-            return {"tipo": tipo, "nivel": "sin_riesgo"}
-        val = float(gray)
-        if val < 0:
-            nivel = "sin riesgo"
-        elif val < 50:
-            nivel = "bajo"
-        elif val < 100:
-            nivel = "medio"
+def parse_desertificacion_summary(obj: Dict[str, Any], tipo: str) -> Dict[str, Any]:
+    if not isinstance(obj, dict) or obj.get("error"):
+        return {"tipo": tipo, "nivel": "nodata", "raw": obj}
+
+    raw = obj.get("raw")
+    if raw:
+        match = re.search(r"(-?\d+(\.\d+)?)", raw)
+        if match:
+            valor = float(match.group(1))
+            if valor <= 0:
+                nivel = "nodata"
+            elif valor < 50:
+                nivel = "bajo"
+            elif valor < 100:
+                nivel = "medio"
+            else:
+                nivel = "alto"
+            return {"tipo": tipo, "valor": valor, "nivel": nivel}
         else:
-            nivel = "alto"
-        return {"tipo": tipo, "nivel": nivel, "valor": val}
-    except Exception:
-        return {"tipo": tipo, "nivel": "nodata"}
+            return {"tipo": tipo, "nivel": "nodata", "raw": raw}
+
+    return {"tipo": tipo, "nivel": "nodata", "raw": obj}
 
 
 # =========================
@@ -205,43 +208,38 @@ def parse_desertificacion(fc: Dict[str, Any], tipo: str) -> Dict[str, Any]:
 async def fetch_all_risks(lat: float, lon: float) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
     async with httpx.AsyncClient() as client:
-        # BBOX comunes
         d_deg = 0.20
-        bbox_c84_small = f"{lon - 0.02},{lat - 0.02},{lon + 0.02},{lat + 0.02}"
+        bbox_c84_small = f"{lon - d_deg},{lat - d_deg},{lon + d_deg},{lat + d_deg}"
 
-        # ----- INCENDIOS -----
-        bbox_crs84 = f"{lon - d_deg},{lat - d_deg},{lon + d_deg},{lat + d_deg}"
-        incendios_urls = [
-            build_gfi_url(
-                "https://wms.mapama.gob.es/sig/Biodiversidad/Incendios/2006_2015",
-                "NZ.HazardArea", bbox=bbox_crs84, crs="CRS:84",
-                info_format="application/json", styles="Biodiversidad_Incendios",
-            )
-        ]
-        results["incendios"] = await fetch_any(client, incendios_urls)
+        # Incendios
+        url_inc = build_gfi_url(
+            "https://wms.mapama.gob.es/sig/Biodiversidad/Incendios/2006_2015",
+            "NZ.HazardArea", bbox=bbox_c84_small, crs="CRS:84",
+            info_format="application/json", styles="Biodiversidad_Incendios"
+        )
+        results["incendios"] = await fetch_any(client, [url_inc])
 
-        # ----- INUNDACIONES -----
-        vendor = {"FI_POINT_TOLERANCE": 8, "FI_LINE_TOLERANCE": 4, "FI_POLYGON_TOLERANCE": 4}
-
+        # Inundación fluvial
         results["inundacion_fluvial"] = {}
         for periodo in ["T10", "T100", "T500"]:
-            url_fluvial = build_gfi_url(
+            url = build_gfi_url(
                 "https://servicios.idee.es/wms-inspire/riesgos-naturales/inundaciones",
                 f"NZ.Flood.Fluvial{periodo}", bbox=bbox_c84_small, crs="CRS:84",
-                info_format="application/json", vendor_params=vendor
+                info_format="application/json"
             )
-            results["inundacion_fluvial"][periodo] = await fetch_any(client, [url_fluvial])
+            results["inundacion_fluvial"][periodo] = await fetch_any(client, [url])
 
+        # Inundación marina
         results["inundacion_marina"] = {}
         for periodo in ["T100", "T500"]:
-            url_marina = build_gfi_url(
+            url = build_gfi_url(
                 "https://servicios.idee.es/wms-inspire/riesgos-naturales/inundaciones",
                 f"NZ.Flood.Marina{periodo}", bbox=bbox_c84_small, crs="CRS:84",
-                info_format="application/json", vendor_params=vendor
+                info_format="application/json"
             )
-            results["inundacion_marina"][periodo] = await fetch_any(client, [url_marina])
+            results["inundacion_marina"][periodo] = await fetch_any(client, [url])
 
-        # ----- SÍSMICO -----
+        # Sísmico
         url_sismico = build_gfi_url(
             "https://www.ign.es/wms-inspire/geofisica",
             "HazardArea2002.NCSE-02", bbox=bbox_c84_small, crs="CRS:84",
@@ -249,16 +247,16 @@ async def fetch_all_risks(lat: float, lon: float) -> Dict[str, Any]:
         )
         results["sismico"] = await fetch_any(client, [url_sismico])
 
-        # ----- DESERTIFICACIÓN -----
+        # Desertificación (potencial + laminar, usando text/plain)
         url_des_pot = build_gfi_url(
             "https://wms.mapama.gob.es/sig/Biodiversidad/INESErosionPotencial/wms.aspx",
             "NZ.HazardArea", bbox=bbox_c84_small, crs="CRS:84",
-            info_format="application/json"
+            info_format="text/plain"
         )
         url_des_lam = build_gfi_url(
             "https://wms.mapama.gob.es/sig/Biodiversidad/INESErosionLaminarRaster/wms.aspx",
             "NZ.HazardArea", bbox=bbox_c84_small, crs="CRS:84",
-            info_format="application/json"
+            info_format="text/plain"
         )
         results["desertificacion_potencial"] = await fetch_any(client, [url_des_pot])
         results["desertificacion_laminar"] = await fetch_any(client, [url_des_lam])
@@ -272,8 +270,8 @@ async def fetch_all_risks(lat: float, lon: float) -> Dict[str, Any]:
 
 @app.get("/api/risk_clean")
 async def api_risk_clean(
-    lat: float = Query(..., description="Latitud WGS84 (grados)"),
-    lon: float = Query(..., description="Longitud WGS84 (grados)"),
+    lat: float = Query(..., description="Latitud WGS84"),
+    lon: float = Query(..., description="Longitud WGS84"),
 ):
     try:
         raw = await fetch_all_risks(lat, lon)
@@ -283,33 +281,32 @@ async def api_risk_clean(
         # Incendios
         out["resumen"]["incendios"] = parse_incendios_summary(raw.get("incendios", {}))
 
-        # Inundación
+        # Inundaciones
         inf = raw.get("inundacion_fluvial", {})
         out["resumen"]["inundacion_fluvial"] = {k: inundable_from_gray(v) for k, v in inf.items()}
 
         im = raw.get("inundacion_marina", {})
         out["resumen"]["inundacion_marina"] = {k: inundable_from_gray(v) for k, v in im.items()}
 
-        # Sísmico
+        # Sismico
         out["resumen"]["sismico"] = parse_sismico_summary(raw.get("sismico", {}))
 
         # Desertificación
         out["resumen"]["desertificacion"] = {
-            "potencial": parse_desertificacion(raw.get("desertificacion_potencial", {}), "potencial"),
-            "laminar": parse_desertificacion(raw.get("desertificacion_laminar", {}), "laminar"),
+            "potencial": parse_desertificacion_summary(raw.get("desertificacion_potencial", {}), "potencial"),
+            "laminar": parse_desertificacion_summary(raw.get("desertificacion_laminar", {}), "laminar"),
         }
 
-        # Sin geometría
+        # Versión sin geometría
         out["sin_geometria"] = {
             "incendios": remove_geometry_from_geojson(raw.get("incendios", {})),
             "inundacion_fluvial": {k: remove_geometry_from_geojson(v) for k, v in inf.items()},
             "inundacion_marina": {k: remove_geometry_from_geojson(v) for k, v in im.items()},
             "sismico": remove_geometry_from_geojson(raw.get("sismico", {})),
-            "desertificacion_potencial": remove_geometry_from_geojson(raw.get("desertificacion_potencial", {})),
-            "desertificacion_laminar": remove_geometry_from_geojson(raw.get("desertificacion_laminar", {})),
+            "desertificacion_potencial": raw.get("desertificacion_potencial", {}),
+            "desertificacion_laminar": raw.get("desertificacion_laminar", {}),
         }
 
         return out
-
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
